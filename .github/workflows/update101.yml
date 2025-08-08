@@ -2,6 +2,9 @@ name: Update GL101 from GL701
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
     - cron: '0 2 * * *' # runs daily at 02:00 UTC
 
