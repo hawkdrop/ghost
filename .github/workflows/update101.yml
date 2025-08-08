@@ -1,0 +1,28 @@
+name: Update GL101 from GL701
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *' # runs daily at 02:00 UTC
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install Dependencies
+        run: npm ci
+      - name: Run GhostScore update
+        env:
+          NOCODB_URL: ${{ secrets.NOCODB_URL }}
+          NOCODB_API_KEY: ${{ secrets.NOCODB_API_KEY }}
+          SOURCE_TABLE: ${{ secrets.SOURCE_TABLE }}
+          TARGET_TABLE: ${{ secrets.TARGET_TABLE }}
+          PAGE_SIZE: ${{ secrets.PAGE_SIZE || '200' }}
+          DRY_RUN: "false"   # CI run should write; change to true to test
+          RATE_LIMIT_MS: '150'
+        run: node src/index.js
