@@ -1,347 +1,187 @@
-import axios from "axios";
-import dotenv from "dotenv";
-import dayjs from "dayjs";
-dotenv.config();
+const axios = require('axios');
 
-const {
-  NOCODB_URL,
-  NOCODB_API_KEY,
-  SOURCE_TABLE = "GL701",
-  TARGET_TABLE = "GL101",
-  PAGE_SIZE = 200,
-  DRY_RUN = "true",
-  RATE_LIMIT_MS = 150,
-} = process.env;
+const NOCO_API_BASE = 'https://your-nocodb-instance.com/api/v1/db/data/v1/your_project';
+const API_TOKEN = 'your_api_token';
 
-if(!NOCODB_URL||!NOCODB_API_KEY){console.error("Error: NOCODB_URL and NOCODB_API_KEY must be set");process.exit(1);}
-const axiosInstance=axios.create({
-  baseURL:NOCODB_URL.replace(/\/$/,""),
-  headers:{"xc-token":NOCODB_API_KEY,"Content-Type":"application/json"},
-  timeout:120000
-});
+// Helper: Fetch all rows from a table with pagination
+async function fetchAllRows(tableName) {
+  let allRows = [];
+  let offset = 0;
+  const limit = 100;
 
-function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
-function normalizeCompanyKey(name){
-  if(!name)return"unknown";
-  return name.toString().normalize("NFKD").replace(/[\u0300-\u036f]/g,"")
-    .replace(/\b(ltd|pvt|private|inc|llc|co|company|ltd\.)\b/gi,"")
-    .replace(/[^a-z0-9]+/gi," ").trim().toLowerCase().replace(/\s+/g,"-");
-}
-function safeGet(row,key){
-  if(!row)return"";
-  if(row[key]!==undefined&&row[key]!==null)return row[key];
-  if(row.fields&&row.fields[key]!==undefined&&row.fields[key]!==null)return row.fields[key];
-  const all={...(row.fields||{}),...row};
-  const found=Object.keys(all).find(k=>k.toLowerCase()===key.toLowerCase());
-  return found?all[found]:"";
-}
-function maskRecruiter(name){
-  if(!name)return"";
-  const s=name.toString();
-  return s.length<=4?s:s.slice(0,4)+"****";
-}
-function topNFromCounts(counts,n=3){
-  return Object.entries(counts).filter(([k])=>k&&k!=="")
-    .sort((a,b)=>b[1]-a[1]).slice(0,n).map(([k])=>k);
-}
-function getRowId(row){
-  return row?.id??row?.ID??row?.insertId??row?.rowid??row?._id??row?.row_id??null;
-}
-function pct(count,total){
-  if(!total)return 0;
-  return Math.round((count/total)*1000)/10;
-}
-function calculateConfidence(N){
-  if(!N)return 0;
-  const val=Math.log10(N+1)/Math.log10(11);
-  return Math.min(1,Math.max(0,val));
-}
-function clamp(n,a=0,b=999){
-  return Math.max(a,Math.min(b,n));
-}
-
-const STAGE_WEIGHTS={
-  "No Response After Application":5,
-  "No Response After Initial Inquiry":5,
-  "Ghosted After First Interview":20,
-  "Ghosted After Multiple Interviews":50,
-  "Ghosted After Completing an Assignment":25,
-  "Ghosted After Verbal Offer":60,
-};
-
-function reportIncrement(r){
-  let inc=0;
-  const stage=safeGet(r,"Where in the Hiring Process Did Ghosting Happen?");
-  inc+=STAGE_WEIGHTS[stage]||0;
-  const assignment=safeGet(r,"What Type of Assignment Was Given?");
-  const assignmentProvided=assignment&&assignment.toString().trim()&&!/no assignments required/i.test(assignment);
-  if(assignmentProvided){
-    inc+=25;
-    const dur=(safeGet(r,"How Long Did It Take You to Complete the Assignment?")||"").toString();
-    if(/<\s*2/i.test(dur)||/less than 2/i.test(dur))inc+=20;
-    else if(/2.?[\-–—]?5/i.test(dur)||/2\s*–\s*5/i.test(dur))inc+=30;
-    else if(/5.?[\-–—]?10/i.test(dur)||/5\s*–\s*10/i.test(dur))inc+=50;
-    else if(/more than 10|> ?10/i.test(dur)||/10\+/.test(dur))inc+=75;
+  while (true) {
+    const url = `${NOCO_API_BASE}/${tableName}?limit=${limit}&offset=${offset}`;
+    const res = await axios.get(url, { headers: { 'xc-token': API_TOKEN } });
+    allRows = allRows.concat(res.data.list);
+    if (res.data.list.length < limit) break;
+    offset += limit;
   }
-  const paid=(safeGet(r,"Was the interview assignment paid?")||"").toString();
-  if(/^\s*no\b/i.test(paid))inc+=30;
-  const feedback=(safeGet(r,"Did You Receive Any Feedback on Your Work?")||"").toString();
-  if(/no[, ]*no feedback/i.test(feedback)||/no feedback/i.test(feedback))inc+=30;
-  else if(/vague/i.test(feedback))inc+=10;
-  const receipt=(safeGet(r,"Did They Confirm Receipt of Your Work?")||"").toString();
-  if(/^\s*no\b/i.test(receipt))inc+=10;
-  const followup=(safeGet(r,"Did You Follow Up After They Stopped Responding?")||"").toString();
-  if(/no response/i.test(followup))inc+=15;
-  else if(/vague excuse/i.test(followup)||/vague/i.test(followup))inc+=8;
-  const wait=(safeGet(r,"How Long Did You Wait Before Realizing You Were Ghosted?")||"").toString();
-  if(/<\s*1/i.test(wait)||/less than 1/i.test(wait)||/<\s*1 Week/i.test(wait))inc+=15;
-  else if(/1.?[\-–—]?2/i.test(wait)||/1\s*–\s*2/i.test(wait))inc+=25;
-  else if(/2.?[\-–—]?4/i.test(wait)||/2\s*–\s*4/i.test(wait))inc+=40;
-  else if(/more than 1 month|> ?1 month/i.test(wait)||/more than 1 month/i.test(wait))inc+=60;
-  const rej=(safeGet(r,"Did You Receive an Official Rejection?")||"").toString();
-  if(/no[, ]*complete silence/i.test(rej)||/no, complete silence/i.test(rej)||/^\s*no\b/i.test(rej))inc+=40;
-  return inc;
+  return allRows;
 }
 
-async function fetchAllRows(tableName){
-  const limit=Number(PAGE_SIZE)||200;
-  let offset=0;
-  let collected=[];
-  while(true){
-    const url=`/api/v2/tables/${encodeURIComponent(tableName)}/records`;
-    const res=await axiosInstance.get(url,{params:{limit,offset}});
-    if(res.status!==200)throw new Error(`Failed fetch rows from ${tableName}: ${res.status}`);
-    const data=res.data.list||[];
-    collected=collected.concat(data);
-    if(data.length<limit)break;
-    offset+=limit;
-    await sleep(50);
-  }
-  console.log(`Fetched ${collected.length} rows from ${tableName}`);
-  return collected;
-}
-
-async function postRowV2(tableName,payload){
-  const url=`/api/v2/tables/${encodeURIComponent(tableName)}/records`;
-  return (await axiosInstance.post(url,payload)).data;
-}
-
-async function patchRowV2(tableName,id,payload){
-  const url=`/api/v2/tables/${encodeURIComponent(tableName)}/records/${id}`;
-  return (await axiosInstance.patch(url,payload)).data;
-}
-
-async function buildTargetCache(){
-  const rows=await fetchAllRows(TARGET_TABLE);
-  const map={};
-  for(const r of rows){
-    const keyRaw=safeGet(r,"Company Key")||safeGet(r,"Company Name")||"";
-    const key=normalizeCompanyKey(keyRaw);
-    const id=getRowId(r);
-    map[key]={row:r,id};
-  }
-  return map;
-}
-
-async function upsertCompany(targetCache,payload){
-  const key=normalizeCompanyKey(payload["Company Key"]||payload["Company Name"]||"");
-  const existing=targetCache[key]||null;
-  if(DRY_RUN.toLowerCase()==="true"){
-    console.log("[DRY RUN] Payload for",key,":",JSON.stringify(payload,null,2));
-    return {dry:true};
-  }
-  if(existing&&existing.id){
-    try{
-      const res=await patchRowV2(TARGET_TABLE,existing.id,payload);
-      await sleep(Number(RATE_LIMIT_MS));
-      return {updated:true,id:existing.id,res};
-    }catch(err){
-      console.error("Patch failed:",err.message||err);
-      throw err;
-    }
-  }else{
-    try{
-      const res=await postRowV2(TARGET_TABLE,payload);
-      await sleep(Number(RATE_LIMIT_MS));
-      return {created:true,res};
-    }catch(err){
-      console.error("Create failed:",err.message||err);
-      throw err;
+// Helper: Upsert a company record in GL101 table
+async function upsertCompany(companyKey, data) {
+  try {
+    // NocoDB upsert: try PATCH (update) first, then POST (create)
+    const patchUrl = `${NOCO_API_BASE}/GL101/${encodeURIComponent(companyKey)}`;
+    await axios.patch(patchUrl, data, { headers: { 'xc-token': API_TOKEN } });
+    console.log(`Updated company ${companyKey}`);
+  } catch (patchErr) {
+    if (patchErr.response && patchErr.response.status === 404) {
+      // Not found, create new record with Company Key included
+      try {
+        const postData = { 'Company Key': companyKey, ...data };
+        await axios.post(`${NOCO_API_BASE}/GL101`, postData, { headers: { 'xc-token': API_TOKEN } });
+        console.log(`Created company ${companyKey}`);
+      } catch (postErr) {
+        console.error(`Create failed for company ${companyKey}`, postErr.response?.data || postErr.message);
+      }
+    } else {
+      console.error(`Update failed for company ${companyKey}`, patchErr.response?.data || patchErr.message);
     }
   }
 }
 
-async function main(){
-  console.log("Starting GhostScore sync",new Date().toISOString());
-  const allRows=await fetchAllRows(SOURCE_TABLE);
-  const groups={};
-  for(const row of allRows){
-    const companyName=(safeGet(row,"Title")||safeGet(row,"Company Name")||"unknown").toString();
-    const key=normalizeCompanyKey(companyName);
-    if(!groups[key])groups[key]={companyName,rows:[]};
-    groups[key].rows.push(row);
+// Main function to sync
+async function syncGhostScore() {
+  console.log('Starting GhostScore sync', new Date().toISOString());
+
+  // Fetch all reports from GL701
+  const reports = await fetchAllRows('GL701');
+  console.log(`Fetched ${reports.length} reports from GL701`);
+
+  // Aggregate data by company
+  const summary = {};
+
+  for (const r of reports) {
+    const companyKey = (r['Title'] || '').toLowerCase().replace(/\s+/g, '-'); // Create normalized key from Title or other field
+    if (!companyKey) continue;
+
+    if (!summary[companyKey]) {
+      summary[companyKey] = {
+        companyName: r['Title'] || '',
+        reportsCount: 0,
+        sumIncrements: 0,
+        firstReportDate: r['Created At'] || null,
+        lastReportDate: r['Created At'] || null,
+        // Initialize percentages and counters
+        noResponseCount: 0,
+        ghostedAfterAssignmentCount: 0,
+        ghostedAfterInterviewCount: 0,
+        ghostedAfterOfferCount: 0,
+        assignmentsGivenCount: 0,
+        unpaidAssignmentCount: 0,
+        confirmedReceiptCount: 0,
+        feedbackReceivedCount: 0,
+        noFeedbackCount: 0,
+        followUpNoResponseCount: 0,
+        officialRejectionCount: 0,
+        aiScreeningRequiredCount: 0,
+        wouldApplyAgainCount: 0,
+        wouldRecommendCount: 0,
+        impactList: [],
+        roleCounts: {},
+        recruiterCounts: {},
+        assignmentTypeCounts: {},
+        locationCounts: {},
+        qualityFlags: [],
+      };
+    }
+
+    const comp = summary[companyKey];
+    comp.reportsCount++;
+
+    // Example increments (you can define your own logic)
+    // For demonstration: assuming each report adds 1 increment to sumIncrements
+    comp.sumIncrements++;
+
+    // Dates
+    const reportDate = new Date(r['Created At']);
+    if (!comp.firstReportDate || reportDate < new Date(comp.firstReportDate)) comp.firstReportDate = r['Created At'];
+    if (!comp.lastReportDate || reportDate > new Date(comp.lastReportDate)) comp.lastReportDate = r['Created At'];
+
+    // Example: count how many had No Response (assuming field 'Did You Receive An Official Rejection?' with values yes/no)
+    if (r['Did You Receive an Official Rejection?'] === 'No Response') comp.noResponseCount++;
+    if (r['Where in the Hiring Process Did Ghosting Happen?'] === 'After Assignment') comp.ghostedAfterAssignmentCount++;
+    if (r['Where in the Hiring Process Did Ghosting Happen?'] === 'After Interview') comp.ghostedAfterInterviewCount++;
+    if (r['Where in the Hiring Process Did Ghosting Happen?'] === 'After Offer') comp.ghostedAfterOfferCount++;
+
+    // Track other counts similarly from single selects or checkboxes
+    if (r['Did They Confirm Receipt of Your Work?'] === 'Yes') comp.confirmedReceiptCount++;
+    if (r['Was the interview assignment paid?'] === 'No') comp.unpaidAssignmentCount++;
+    if (r['Did You Receive Any Feedback on Your Work?'] === 'Yes') comp.feedbackReceivedCount++;
+    if (r['Did You Receive Any Feedback on Your Work?'] === 'No') comp.noFeedbackCount++;
+    if (r['Did You Follow Up After They Stopped Responding?'] === 'Yes') comp.followUpNoResponseCount++;
+    if (r['AI Screening Required?'] === 'Yes' || r['Did the Company Require AI Screening Before Any Interview?'] === 'Yes') comp.aiScreeningRequiredCount++;
+
+    if (r['Would You Apply to This Company Again?'] === 'Yes') comp.wouldApplyAgainCount++;
+    if (r['Would You Recommend This Employer?'] === 'Yes') comp.wouldRecommendCount++;
+
+    // Collect impacts (multi select)
+    if (r['How Did This Ghosting Experience Affect You?']) {
+      comp.impactList.push(r['How Did This Ghosting Experience Affect You?']);
+    }
+
+    // Count roles
+    const role = r['Job Role Applied For'];
+    if (role) comp.roleCounts[role] = (comp.roleCounts[role] || 0) + 1;
+
+    // Count recruiters
+    const recruiter = r['Recruiter Name or Email (Optional)'];
+    if (recruiter) comp.recruiterCounts[recruiter] = (comp.recruiterCounts[recruiter] || 0) + 1;
+
+    // Count assignment types
+    const assignmentType = r['What Type of Assignment Was Given?'];
+    if (assignmentType) comp.assignmentTypeCounts[assignmentType] = (comp.assignmentTypeCounts[assignmentType] || 0) + 1;
+
+    // Count locations
+    const location = r['Company Location'];
+    if (location) comp.locationCounts[location] = (comp.locationCounts[location] || 0) + 1;
+
+    // Data Quality Flag: collect if any low evidence flags from reports or skip for now
   }
-  const targetCache=await buildTargetCache();
 
-  for(const [companyKey,group]of Object.entries(groups)){
-    const rows=group.rows;
-    const N=rows.length;
+  // Now build upsert payloads for each company summary
+  for (const [companyKey, comp] of Object.entries(summary)) {
+    // Calculate percentages (avoid divide by zero)
+    const count = comp.reportsCount || 1;
 
-    const stats={
-      sumIncrements:0,
-      stageCounts:{},
-      assignmentGivenCount:0,
-      unpaidCount:0,
-      receiptYesCount:0,
-      feedbackYesCount:0,
-      feedbackNoCount:0,
-      followupNoResponseCount:0,
-      followupVagueCount:0,
-      officialRejectionCount:0,
-      aiScreeningCount:0,
-      applyAgainYesCount:0,
-      recommendYesCount:0,
-      roleCounts:{},
-      recruiterCounts:{},
-      assignmentTypeCounts:{},
-      locationCounts:{},
-      impactCounts:{},
-      firstDate:null,
-      lastDate:null,
+    const payload = {
+      'Company Name': comp.companyName,
+      'Reports Count': count,
+      'Sum Increments': comp.sumIncrements,
+      'Avg Report Increment': comp.sumIncrements / count,
+      'First Report Date': comp.firstReportDate,
+      'Last Report Date': comp.lastReportDate,
+      'No Response %': (comp.noResponseCount / count) * 100,
+      'Ghosted After Assignment %': (comp.ghostedAfterAssignmentCount / count) * 100,
+      'Ghosted After Interview %': (comp.ghostedAfterInterviewCount / count) * 100,
+      'Ghosted After Offer %': (comp.ghostedAfterOfferCount / count) * 100,
+      'Assignments Given %': (comp.assignmentsGivenCount || 0) / count * 100,
+      'Unpaid Assignment %': (comp.unpaidAssignmentCount / count) * 100,
+      'Confirmed Receipt %': (comp.confirmedReceiptCount / count) * 100,
+      'Feedback Received %': (comp.feedbackReceivedCount / count) * 100,
+      'No Feedback %': (comp.noFeedbackCount / count) * 100,
+      'Follow-up No Response %': (comp.followUpNoResponseCount / count) * 100,
+      'Official Rejection %': (comp.officialRejectionCount / count) * 100,
+      'AI Screening Required %': (comp.aiScreeningRequiredCount / count) * 100,
+      'Would Apply Again %': (comp.wouldApplyAgainCount / count) * 100,
+      'Would Recommend %': (comp.wouldRecommendCount / count) * 100,
+      'Top 3 Roles': Object.entries(comp.roleCounts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]).join(', '),
+      'Top 3 Recruiters': Object.entries(comp.recruiterCounts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]).join(', '),
+      'Top 3 Assignment Types': Object.entries(comp.assignmentTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]).join(', '),
+      'Top 3 Locations': Object.entries(comp.locationCounts).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]).join(', '),
+      'Common Impact': comp.impactList.join('; '),
+      'Data Quality Flag': 'ok', // or your logic here
+      'Confidence Score': 0.8,   // example fixed score, replace with your calc
+      'Notes': '',               // leave empty or fill
     };
 
-    for(const r of rows){
-      const inc=reportIncrement(r);
-      stats.sumIncrements+=inc;
-      const stage=safeGet(r,"Where in the Hiring Process Did Ghosting Happen?")||"";
-      stats.stageCounts[stage]=(stats.stageCounts[stage]||0)+1;
-
-      const assignment=safeGet(r,"What Type of Assignment Was Given?")||safeGet(r,"Other Assignment Type")||"";
-      if(assignment&&!/no assignments required/i.test(assignment))stats.assignmentGivenCount++;
-
-      const paid=(safeGet(r,"Was the interview assignment paid?")||"").toString();
-      if(/^\s*no\b/i.test(paid))stats.unpaidCount++;
-
-      const receipt=(safeGet(r,"Did They Confirm Receipt of Your Work?")||"").toString();
-      if(/^\s*yes\b/i.test(receipt))stats.receiptYesCount++;
-
-      const feedback=(safeGet(r,"Did You Receive Any Feedback on Your Work?")||"").toString();
-      if(/^\s*no\b/i.test(feedback)||/no feedback/i.test(feedback))stats.feedbackNoCount++;
-      else if(/^\s*yes\b/i.test(feedback)||/yes/i.test(feedback)){
-        if(/vague/i.test(feedback))stats.feedbackYesCount+=0;else stats.feedbackYesCount++;
-      }
-
-      const followup=(safeGet(r,"Did You Follow Up After They Stopped Responding?")||"").toString();
-      if(/no response/i.test(followup))stats.followupNoResponseCount++;
-      else if(/vague/i.test(followup))stats.followupVagueCount++;
-
-      const rej=(safeGet(r,"Did You Receive an Official Rejection?")||"").toString();
-      if(/^\s*yes\b/i.test(rej)||/formal email/i.test(rej))stats.officialRejectionCount++;
-
-      const ai=(safeGet(r,"Did the Company Require AI Screening Before Any Interview?")||"").toString();
-      if(/^\s*yes\b/i.test(ai))stats.aiScreeningCount++;
-
-      const again=(safeGet(r,"Would You Apply to This Company Again?")||"").toString();
-      if(/^\s*yes\b/i.test(again))stats.applyAgainYesCount++;
-
-      const rec=(safeGet(r,"Would You Recommend This Employer?")||"").toString();
-      if(/^\s*yes\b/i.test(rec))stats.recommendYesCount++;
-
-      const role=(safeGet(r,"Job Role Applied For")||safeGet(r,"Other Role")||"").toString();
-      if(role)stats.roleCounts[role]=(stats.roleCounts[role]||0)+1;
-
-      const recName=(safeGet(r,"Recruiter Name or Email (Optional)")||"").toString();
-      if(recName)stats.recruiterCounts[recName]=(stats.recruiterCounts[recName]||0)+1;
-
-      const at=assignment||"";
-      if(at)stats.assignmentTypeCounts[at]=(stats.assignmentTypeCounts[at]||0)+1;
-
-      const loc=(safeGet(r,"Company Location")||safeGet(r,"Other Location")||"").toString();
-      if(loc)stats.locationCounts[loc]=(stats.locationCounts[loc]||0)+1;
-
-      const impact=(safeGet(r,"How Did This Ghosting Experience Affect You?")||"").toString();
-      if(impact){
-        const items=impact.toString().split(",").map(x=>x.trim()).filter(Boolean);
-        for(const it of items)stats.impactCounts[it]=(stats.impactCounts[it]||0)+1;
-      }
-
-      const created=r._created_at||r.createdAt||r.created_at||r.created;
-      if(created){
-        const d=new Date(created);
-        if(!stats.firstDate||d<stats.firstDate)stats.firstDate=d;
-        if(!stats.lastDate||d>stats.lastDate)stats.lastDate=d;
-      }
-    }
-
-    const sum_increments=stats.sumIncrements;
-    const damping=N/(N+1);
-    const normalized_increment=sum_increments*damping;
-    const raw_score=500+normalized_increment;
-    const ghostScore=clamp(Math.round(raw_score),0,999);
-    const avg_increment=N?Math.round((sum_increments/N)*10)/10:0;
-
-    const noResponseCount=(stats.stageCounts["No Response After Application"]||0)+(stats.stageCounts["No Response After Initial Inquiry"]||0);
-    const ghostedAfterAssignmentCount=stats.stageCounts["Ghosted After Completing an Assignment"]||0;
-    const ghostedAfterInterviewCount=(stats.stageCounts["Ghosted After First Interview"]||0)+(stats.stageCounts["Ghosted After Multiple Interviews"]||0);
-    const ghostedAfterOfferCount=stats.stageCounts["Ghosted After Verbal Offer"]||0;
-
-    const topRoles=topNFromCounts(stats.roleCounts,3);
-    const topRecruiters=topNFromCounts(stats.recruiterCounts,3).map(maskRecruiter);
-    const topAssignmentTypes=topNFromCounts(stats.assignmentTypeCounts,3);
-    const topLocations=topNFromCounts(stats.locationCounts,3);
-    const topImpacts=topNFromCounts(stats.impactCounts,3);
-
-    const confidence=calculateConfidence(N);
-
-    const firstDate=stats.firstDate?dayjs(stats.firstDate).format("YYYY-MM-DD"):"";
-    const lastDate=stats.lastDate?dayjs(stats.lastDate).format("YYYY-MM-DD"):"";
-
-    const payload={
-      "Company Key":companyKey,
-      "Company Name":group.companyName,
-      "Reports Count":N,
-      "Sum Increments":Math.round(sum_increments),
-      "Avg Report Increment":avg_increment,
-      "GhostScore":ghostScore,
-      "No Response Count":noResponseCount,
-      "Ghosted After Assignment Count":ghostedAfterAssignmentCount,
-      "Ghosted After Interview Count":ghostedAfterInterviewCount,
-      "Ghosted After Offer Count":ghostedAfterOfferCount,
-      "Assignment Given Count":stats.assignmentGivenCount,
-      "Unpaid Assignment Count":stats.unpaidCount,
-      "Receipt Confirmed Count":stats.receiptYesCount,
-      "Feedback Yes Count":stats.feedbackYesCount,
-      "Feedback No Count":stats.feedbackNoCount,
-      "Followup No Response Count":stats.followupNoResponseCount,
-      "Followup Vague Count":stats.followupVagueCount,
-      "Official Rejection Count":stats.officialRejectionCount,
-      "AI Screening Count":stats.aiScreeningCount,
-      "Apply Again Yes Count":stats.applyAgainYesCount,
-      "Recommend Yes Count":stats.recommendYesCount,
-      "Top Roles":topRoles.join(", "),
-      "Top Recruiters":topRecruiters.join(", "),
-      "Top Assignment Types":topAssignmentTypes.join(", "),
-      "Top Locations":topLocations.join(", "),
-      "Top Impacts":topImpacts.join(", "),
-      "Confidence":confidence,
-      "First Report Date":firstDate,
-      "Last Report Date":lastDate,
-      "Last Synced":dayjs().format(),
-    };
-
-    try{
-      const result=await upsertCompany(targetCache,payload);
-      if(result.dry)console.log("[DRY RUN] Would upsert company:",companyKey);
-      else if(result.updated)console.log("Updated company:",companyKey);
-      else if(result.created)console.log("Created company:",companyKey);
-    }catch(err){
-      console.error("Error upserting company",companyKey,err.message||err);
-    }
+    await upsertCompany(companyKey, payload);
   }
-  console.log("Finished GhostScore sync",new Date().toISOString());
+
+  console.log('Finished GhostScore sync', new Date().toISOString());
 }
 
-main().catch(e=>{
-  console.error("Fatal error:",e);
-  process.exit(1);
-});
+// Run the sync
+syncGhostScore().catch(console.error);
